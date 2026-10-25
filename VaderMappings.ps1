@@ -1,3 +1,4 @@
+#requires -Version 7.2
 param(
     [ValidateSet('Gui','Read','Apply','Test')][string]$Mode = 'Gui',
     [string]$Source,
@@ -21,7 +22,7 @@ if ($Mode -eq 'Gui' -and -not $GuiChild) {
 }
 if (-not ('VaderLink' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'VaderLink.cs') }
 $script:KeyIds = [ordered]@{ Up=0; Right=1; Down=2; Left=3; A=4; B=5; View=6; X=7; Y=8; Menu=9; LB=10; RB=11; LT=12; RT=13; L3=14; R3=15; C=16; Z=17; M1=18; M2=19; M3=20; M4=21; LM=22; RM=23 }
-$script:Choices = [ordered]@{ '保留目前設定'=-1; '預設'=255; '停用'=254; A=4; B=5; X=7; Y=8; LB=10; RB=11; LT=12; RT=13; L3=14; R3=15; Up=0; Down=2; Left=3; Right=1; View=6; Menu=9 }
+$script:Choices = [ordered]@{ '保留目前設定'=-1; '預設'=255; '停用遊戲輸出'=254; A=4; B=5; X=7; Y=8; LB=10; RB=11; LT=12; RT=13; L3=14; R3=15; Up=0; Down=2; Left=3; Right=1; View=6; Menu=9 }
 
 function Open-Vader {
     if (Get-Process -Name 'Flydigi Space Station' -ErrorAction SilentlyContinue) { throw '請先從系統匣完整退出飛智空間站，再使用此工具。' }
@@ -30,7 +31,10 @@ function Open-Vader {
     $devices = @(Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'HID\VID_37D7&PID_2401&MI_01\*' })
     if ($devices.Count -ne 1) { throw '請連接一支黑武士 5 Pro（USB 線或接收器），並保持手把開機。' }
     $hidPath = '\\?\' + $devices[0].InstanceId.Replace('\','#').ToLowerInvariant() + '#{4d1e55b2-f16f-11cf-88cb-001111000030}'
-    [VaderLink]::new($hidPath,0)
+    $wireless=$false
+    $markers=@(Get-PnpDevice -PresentOnly|Where-Object {$_.InstanceId -like 'HID\VID_37D7&PID_2401&MI_03\*'})
+    foreach($marker in $markers){$markerPath='\\?\'+$marker.InstanceId.Replace('\','#').ToLowerInvariant()+'#{4d1e55b2-f16f-11cf-88cb-001111000030}';if([VaderLink]::UsagePage($markerPath) -eq 0xFFEE){$wireless=$true}}
+    [VaderLink]::new($hidPath,0,$wireless)
 }
 function Assert-Firmware($connection) {
     $info = $connection.Request(0x01)
@@ -48,8 +52,33 @@ function Get-VaderState {
         $second = $connection.ReadBlob(0xA3,[byte]$profile)
         if ([Convert]::ToHexString($mapping) -ne [Convert]::ToHexString($second)) { throw '兩次讀取不同；尚未寫入。請保持空間站關閉後重新讀取。' }
         if ($mapping.Length -ne 840 -or $mapping[0] -ne 2 -or $mapping[1] -ne 3) { throw '不支援此配置格式，已停止寫入。' }
-        [pscustomobject]@{ Profile=$profile; Mapping=$mapping; Firmware='7.1.5.4'; TurboEnabled=(($hardware[6] -band 8) -ne 0) }
+        [pscustomobject]@{ Profile=$profile; Mapping=$mapping; Firmware='7.1.5.4'; TurboEnabled=(($hardware[6] -band 8) -ne 0);Connection=$(if($connection.Wireless){'USB 2.4G'}else{'USB'}) }
     } finally { $connection.Dispose() }
+}
+function New-VaderMapping([byte[]]$current,[System.Collections.IDictionary]$changes,[System.Collections.IDictionary]$turboChanges,[bool]$turboEnabled) {
+    if($current.Length -ne 840 -or $current[0] -ne 2 -or $current[1] -ne 3){throw '不支援此配置格式。'}
+    $desired=[byte[]]$current.Clone()
+    foreach($key in $changes.Keys){
+        if(-not $script:KeyIds.Contains($key)){throw "不支援的來源按鍵：$key"}
+        $value=[int]$changes[$key]
+        if($value -eq -1){continue}
+        if($value -notin @($script:Choices.Values)){throw '不支援的輸出按鍵。'}
+        $offset=13+3*$script:KeyIds[$key]
+        if($desired[$offset] -ne $value){$desired[$offset]=[byte]$value;$desired[$offset+1]=0;$desired[$offset+2]=0}
+    }
+    foreach($key in $turboChanges.Keys){
+        if(-not $script:KeyIds.Contains($key)){throw "不支援的連發來源：$key"}
+        $mode=[int]$turboChanges[$key].Mode;$rate=[int]$turboChanges[$key].Rate
+        if($mode -notin @(0,1,2) -or ($mode -ne 0 -and ($rate -lt 1 -or $rate -gt 20))){throw '連發模式或速度無效。'}
+        $offset=13+3*$script:KeyIds[$key]
+        if($mode -ne 0){
+            if(-not $turboEnabled){throw '請勾選 Turbo 總開關，或使用 -TurboMaster On。'}
+            if($desired[$offset] -eq 255){if($script:KeyIds[$key] -ge 16){throw "$key 請先選擇遊戲輸出按鍵，再設定連發。"};$desired[$offset]=[byte]$script:KeyIds[$key]}
+            if($desired[$offset] -ge 32){throw "$key 的目前功能不支援直接連發；請先選擇一般手把輸出。"}
+        }
+        $desired[$offset+1]=[byte]$mode;$desired[$offset+2]=[byte]$(if($mode -eq 0){0}else{$rate})
+    }
+    return ,$desired
 }
 function Set-VaderState($state, [System.Collections.IDictionary]$changes, [System.Collections.IDictionary]$turboChanges=@{}, $master=$null) {
     $connection = Open-Vader
@@ -61,41 +90,17 @@ function Set-VaderState($state, [System.Collections.IDictionary]$changes, [Syste
         if ($connection.Request(0xA1)[5] -ne $state.Profile) { throw '手把已切換配置。請重新讀取後再儲存。' }
         $current = $connection.ReadBlob(0xA3,[byte]$state.Profile)
         if ([Convert]::ToHexString($current) -ne [Convert]::ToHexString($state.Mapping)) { throw '配置已被其他程式修改。請重新讀取後再調整。' }
-        $desired = [byte[]]$current.Clone()
         $hardware=$connection.Request(0x03);$originalMaster=($hardware[6] -band 8) -ne 0
         $desiredMaster=if($null -eq $master){$originalMaster}else{[bool]$master}
-        foreach ($key in $changes.Keys) {
-            if (-not $script:KeyIds.Contains($key)) { throw "不支援的來源按鍵：$key" }
-            $value = [int]$changes[$key]
-            if ($value -eq -1) { continue }
-            if ($value -notin @($script:Choices.Values)) { throw '不支援的輸出按鍵。' }
-            if ($key -eq 'R3' -and $value -ne 254) { throw '實體 R3 固定停用，不能重新啟用。' }
-            $offset = 13 + 3 * $script:KeyIds[$key]
-            if ($desired[$offset] -ne $value) { $desired[$offset]=[byte]$value; $desired[$offset+1]=0; $desired[$offset+2]=0 }
-        }
-        foreach($key in $turboChanges.Keys){
-            if(-not $script:KeyIds.Contains($key)){throw "不支援的連發來源：$key"}
-            $mode=[int]$turboChanges[$key].Mode;$rate=[int]$turboChanges[$key].Rate
-            if($mode -notin @(0,1,2) -or ($mode -ne 0 -and ($rate -lt 1 -or $rate -gt 20))){throw '連發模式或速度無效。'}
-            if($key -eq 'R3' -and $mode -ne 0){throw '實體 R3 固定停用，不能啟用連發。'}
-            $offset=13+3*$script:KeyIds[$key]
-            if($mode -ne 0){
-                if(-not $desiredMaster){throw '請勾選 Turbo 總開關，或使用 -TurboMaster On。'}
-                if($desired[$offset] -eq 255){if($script:KeyIds[$key] -ge 16){throw "$key 請先選擇遊戲輸出按鍵，再設定連發。"};$desired[$offset]=[byte]$script:KeyIds[$key]}
-                if($desired[$offset] -ge 32){throw "$key 的目前功能不支援直接連發；請先選擇一般手把輸出。"}
-            }
-            $desired[$offset+1]=[byte]$mode;$desired[$offset+2]=[byte]$(if($mode -eq 0){0}else{$rate})
-        }
-        # This is an output mask. The physical R3 remains visible in raw reports.
-        $desired[58]=254; $desired[59]=0; $desired[60]=0
+        $desired=New-VaderMapping $current $changes $turboChanges $desiredMaster
         $mappingChanged=[Convert]::ToHexString($desired) -ne [Convert]::ToHexString($current)
         if (-not $mappingChanged -and $desiredMaster -eq $originalMaster) { return '設定已相同，沒有重複寫入。' }
         $oldTag = [BitConverter]::ToUInt16($current,225)
         do { $tag = Get-Random -Minimum 0 -Maximum 65535 } while ($tag -eq $oldTag)
         if($mappingChanged){$desired[225]=[byte]($tag -band 255); $desired[226]=[byte]($tag -shr 8)}
-        # Only changed button entries, the forced R3 mask, and the revision tag may differ.
+        # Only explicitly edited button entries and the revision tag may differ.
         $allowed = [Collections.Generic.HashSet[int]]::new()
-        foreach ($n in @(58,59,60,225,226)) { [void]$allowed.Add($n) }
+        foreach ($n in @(225,226)) { [void]$allowed.Add($n) }
         foreach ($key in $changes.Keys) { $base=13+3*$script:KeyIds[$key]; foreach($n in $base..($base+2)){ [void]$allowed.Add($n) } }
         foreach ($key in $turboChanges.Keys) { $base=13+3*$script:KeyIds[$key]; foreach($n in $base..($base+2)){ [void]$allowed.Add($n) } }
         for ($n=0; $n -lt 840; $n++) { if ($desired[$n] -ne $current[$n] -and -not $allowed.Contains($n)) { throw "未授權的配置變更：$n" } }
@@ -119,19 +124,19 @@ function Set-VaderState($state, [System.Collections.IDictionary]$changes, [Syste
     } finally { $connection.Dispose() }
 }
 function Get-DisplayTarget([byte]$value) {
-    if ($value -eq 254 -or $value -eq 32) { return '保留目前設定' }
+    if ($value -eq 32) { return '保留目前設定' }
     foreach ($choice in $script:Choices.Keys) { if ($script:Choices[$choice] -eq $value) { return $choice } }
     '保留目前設定'
 }
 if ($Mode -eq 'Read') {
     $state = Get-VaderState
     $buttons = foreach($key in $script:KeyIds.Keys) { $offset=13+3*$script:KeyIds[$key]; [ordered]@{ source=$key; target=$state.Mapping[$offset]; mode=$state.Mapping[$offset+1]; frequency=$state.Mapping[$offset+2] } }
-    [ordered]@{ profile=$state.Profile+1; firmware=$state.Firmware; layout='3.2'; turboEnabled=$state.TurboEnabled; buttons=$buttons } | ConvertTo-Json -Depth 6
+    [ordered]@{ profile=$state.Profile+1; firmware=$state.Firmware; layout='3.2'; connection=$state.Connection; turboEnabled=$state.TurboEnabled; buttons=$buttons } | ConvertTo-Json -Depth 6
     exit
 }
 if ($Mode -eq 'Apply') {
-    $Target=switch($Target){'Default'{'預設'} 'Disabled'{'停用'} 'Keep'{'保留目前設定'} default{$Target}}
-    if (-not $Source -or -not $Target -or -not $script:Choices.Contains($Target)) { throw '請指定 -Source M1 -Target R3（或 A、B、停用等）。' }
+    $Target=switch($Target){'Default'{'預設'} 'Disabled'{'停用遊戲輸出'} '停用'{'停用遊戲輸出'} 'Keep'{'保留目前設定'} default{$Target}}
+    if (-not $Source -or -not $Target -or -not $script:Choices.Contains($Target)) { throw '請指定來源與輸出，例如 -Source C -Target A，或 -Target Disabled。' }
     $state=Get-VaderState
     $turbo=@{};if($TurboMode -ne 'Keep'){$modeValue=switch($TurboMode){'Off'{0}'Hold'{1}'Toggle'{2}};$turbo[$Source]=@{Mode=$modeValue;Rate=$TurboRate}}
     $masterValue=switch($TurboMaster){'On'{$true}'Off'{$false}default{$null}}
@@ -147,7 +152,7 @@ if ($Mode -eq 'Test') {
         $previousFlags=[byte[]]$reportStatus[5..9]
         [void]$connection.Request(0x11,255,1,255,255,255)
         $end=[DateTime]::UtcNow.AddSeconds($Seconds); $frames=0; $last=$null; $latest=$null
-        while([DateTime]::UtcNow -lt $end){$report=$connection.Read(30);$raw=[VaderLink]::RawInput($report);if($null -ne $raw){$latest=$raw;$frames++};$output=[VaderLink]::GameOutput();$description="raw=$($latest.Pressed); output=$($output.Pressed)";if($description -ne $last){[pscustomobject]@{time=(Get-Date -Format 'HH:mm:ss.fff');rawR3=$latest.R3;rawM1=$latest.M1;rawButtons=$latest.Pressed;outputR3=$output.R3;outputButtons=$output.Pressed}|ConvertTo-Json -Compress;$last=$description}}
+        while([DateTime]::UtcNow -lt $end){$report=$connection.Read(30);$raw=[VaderLink]::RawInput($report);if($null -ne $raw){$latest=$raw;$frames++};$output=[VaderLink]::GameOutput();$description="raw=$($latest.Pressed); output=$($output.Pressed)";if($description -ne $last){[pscustomobject]@{time=(Get-Date -Format 'HH:mm:ss.fff');rawButtons=$latest.Pressed;outputButtons=$output.Pressed;outputSlot=$output.Slot;outputConnected=$output.Connected}|ConvertTo-Json -Compress;$last=$description}}
         if($frames -eq 0){throw '沒有收到原始按鍵資料。'}
         "Raw frames received: $frames"
     } finally {if($previousFlags){try{[void]$connection.Request(0x11,$previousFlags)}catch{Write-Warning '裝置已斷線；重新插入可結束原始測試模式。'}};$connection.Dispose()}
@@ -157,12 +162,12 @@ if ($Mode -eq 'Test') {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
-$form=[Windows.Forms.Form]::new(); $form.Text='黑武士 5 Pro — 直接改鍵與測試（R3 固定停用）'; $form.Size=[Drawing.Size]::new(780,850); $form.MinimumSize=[Drawing.Size]::new(700,600); $form.StartPosition='CenterScreen'; $form.Font=[Drawing.Font]::new('Microsoft JhengHei UI',10);$form.AutoScaleMode='Dpi'
+$form=[Windows.Forms.Form]::new(); $form.Text='Vader5 Pro Mapper — 改鍵與測試'; $form.Size=[Drawing.Size]::new(780,850); $form.MinimumSize=[Drawing.Size]::new(700,600); $form.StartPosition='CenterScreen'; $form.Font=[Drawing.Font]::new('Microsoft JhengHei UI',10);$form.AutoScaleMode='Dpi'
 $tabs=[Windows.Forms.TabControl]::new();$tabs.Dock='Fill';$editor=[Windows.Forms.TabPage]::new('按鍵映射');$testPage=[Windows.Forms.TabPage]::new('按鍵測試');$tabs.TabPages.Add($editor);$tabs.TabPages.Add($testPage);$form.Controls.Add($tabs)
 $editorLayout=[Windows.Forms.TableLayoutPanel]::new();$editorLayout.Dock='Fill';$editorLayout.Padding=[Windows.Forms.Padding]::new(12);$editorLayout.ColumnCount=1;$editorLayout.RowCount=5
 [void]$editorLayout.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent,100))
 foreach($kind in @('AutoSize','Percent','AutoSize','AutoSize','AutoSize')){[void]$editorLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::$kind,100))};$editor.Controls.Add($editorLayout)
-$hint=[Windows.Forms.Label]::new();$hint.AutoSize=$true;$hint.Dock='Fill';$hint.Text="不讀取按鍵來選映射，所以卡住的 R3 不會搶走操作。`n用右欄選輸出，再按「儲存到手把」。M1 可設成 R3。";$editorLayout.Controls.Add($hint,0,0)
+$hint=[Windows.Forms.Label]::new();$hint.AutoSize=$true;$hint.Dock='Fill';$hint.Text="選擇按鍵輸出與連發模式，再儲存至目前配置。`n未修改的按鍵會保留原設定。";$editorLayout.Controls.Add($hint,0,0)
 $grid=[Windows.Forms.DataGridView]::new();$grid.Dock='Fill';$grid.AllowUserToAddRows=$false;$grid.AllowUserToDeleteRows=$false;$grid.RowHeadersVisible=$false;$grid.AutoSizeColumnsMode='Fill';$grid.SelectionMode='CellSelect';$grid.BackgroundColor=[Drawing.Color]::White;$grid.EditMode='EditOnEnter';$grid.DefaultCellStyle.BackColor=[Drawing.Color]::White;$grid.DefaultCellStyle.ForeColor=[Drawing.Color]::Black;$grid.DefaultCellStyle.SelectionBackColor=[Drawing.Color]::LightBlue;$grid.DefaultCellStyle.SelectionForeColor=[Drawing.Color]::Black;$grid.RowTemplate.Height=28
 $sourceColumn=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $sourceColumn.HeaderText='實體來源按鍵'; $sourceColumn.ReadOnly=$true; [void]$grid.Columns.Add($sourceColumn)
 $targetColumn=[Windows.Forms.DataGridViewComboBoxColumn]::new();$targetColumn.HeaderText='輸出映射';$targetColumn.FlatStyle='Standard';foreach($choice in $script:Choices.Keys){[void]$targetColumn.Items.Add($choice)};[void]$grid.Columns.Add($targetColumn);$editorLayout.Controls.Add($grid,0,1)
@@ -190,10 +195,19 @@ $load=[Windows.Forms.Button]::new();$load.Text='重新讀取';$load.AutoSize=$tr
 $save=[Windows.Forms.Button]::new();$save.Text='儲存到手把';$save.AutoSize=$true;$save.MinimumSize=[Drawing.Size]::new(150,36);$save.Enabled=$false;$toolbar.Controls.Add($save)
 $masterToggle=[Windows.Forms.CheckBox]::new();$masterToggle.Text='Turbo 總開關（所有配置）';$masterToggle.AutoSize=$true;$masterToggle.Margin=[Windows.Forms.Padding]::new(16,10,0,0);$toolbar.Controls.Add($masterToggle)
 $status=[Windows.Forms.Label]::new();$status.AutoSize=$true;$status.Dock='Fill';$status.Text='尚未連接。';$editorLayout.Controls.Add($status,0,3)
-$foot=[Windows.Forms.Label]::new();$foot.AutoSize=$true;$foot.Dock='Fill';$foot.Text='連發速度 1～20 次／秒。巨集與鍵盤滑鼠功能可保留，此工具不編輯它們。';$foot.Font=[Drawing.Font]::new('Microsoft JhengHei UI',8);$editorLayout.Controls.Add($foot,0,4)
+$foot=[Windows.Forms.Label]::new();$foot.AutoSize=$true;$foot.Dock='Fill';$foot.Text="連發速度 1～20 次／秒。巨集與鍵鼠功能可保留，此工具不編輯它們。`n「停用遊戲輸出」不會清除既有鍵盤／滑鼠綁定。";$foot.Font=[Drawing.Font]::new('Microsoft JhengHei UI',8);$editorLayout.Controls.Add($foot,0,4)
 $script:LoadedState=$null
+$script:LoadingGrid=$false
+$script:DraftChanged=$false
+$statusTip=[Windows.Forms.ToolTip]::new();$statusTip.SetToolTip($load,'重新讀取手把配置；尚未儲存的修改會被捨棄。')
+$markDirty={if($script:LoadedState -and -not $script:LoadingGrid){$script:DraftChanged=$true;$status.Text="配置 $($script:LoadedState.Profile+1) 有未儲存變更。"}}
+$grid.Add_CurrentCellDirtyStateChanged({if($grid.IsCurrentCellDirty){[void]$grid.CommitEdit([Windows.Forms.DataGridViewDataErrorContexts]::Commit)}})
+$grid.Add_CellValueChanged($markDirty)
+$masterToggle.Add_CheckedChanged($markDirty)
 $reload={
     $load.Enabled=$false; $save.Enabled=$false; $form.UseWaitCursor=$true
+    $script:LoadingGrid=$true
+    $script:ReloadSucceeded=$false
     try {
         $script:LoadedState=Get-VaderState
         $grid.Rows.Clear()
@@ -201,32 +215,36 @@ $reload={
             $offset=13+3*$script:KeyIds[$key];$display=Get-DisplayTarget $script:LoadedState.Mapping[$offset]
             $mode=[int]$script:LoadedState.Mapping[$offset+1];$rate=[int]$script:LoadedState.Mapping[$offset+2]
             $modeLabel=switch($mode){1{'按住連發'}2{'按一下切換'}default{'關閉'}}
-            if($key -eq 'R3'){$display='停用';$modeLabel='關閉';$rate=0}
-            $row=$grid.Rows.Add($key,$display,$modeLabel,$rate);$grid.Rows[$row].Tag=$key
-            if($key -eq 'R3'){$grid.Rows[$row].ReadOnly=$true;$grid.Rows[$row].DefaultCellStyle.BackColor=[Drawing.Color]::FromArgb(235,238,241)}
+            $row=$grid.Rows.Add($key,$display,$modeLabel,$rate);$grid.Rows[$row].Tag=[pscustomobject]@{Key=$key;Target=$display;Mode=$modeLabel;Rate=[string]$rate}
         }
         $masterToggle.Checked=$script:LoadedState.TurboEnabled
-        $masked=$script:LoadedState.Mapping[58] -eq 254
-        $status.Text="已讀取配置 $($script:LoadedState.Profile+1) · 韌體 7.1.5.4。"+$(if($masked){' R3 輸出已停用。'}else{' 按儲存後會停用 R3 輸出。'})
+        $script:DraftChanged=$false
+        $status.Text="配置 $($script:LoadedState.Profile+1) · $($script:LoadedState.Connection) · 韌體 $($script:LoadedState.Firmware) · 已讀取"
         $save.Enabled=$true
-    } catch { $status.Text=$_.Exception.Message }
-    finally { $load.Enabled=$true; $form.UseWaitCursor=$false }
+        $script:ReloadSucceeded=$true
+    } catch { $status.Text='讀取失敗：'+$_.Exception.GetBaseException().Message }
+    finally { $script:LoadingGrid=$false;$load.Enabled=$true; $form.UseWaitCursor=$false }
 }
-$load.Add_Click($reload)
+$load.Add_Click({if($script:DraftChanged -and [Windows.Forms.MessageBox]::Show($form,'捨棄未儲存的修改，重新讀取手把配置？','重新讀取','YesNo','Question') -ne 'Yes'){return};& $reload})
 $save.Add_Click({
     $load.Enabled=$false; $save.Enabled=$false; $form.UseWaitCursor=$true
     try {
         [void]$grid.EndEdit();$changes=[ordered]@{};$turboChanges=[ordered]@{}
         foreach($row in $grid.Rows){
-            $key=[string]$row.Tag;$choice=[string]$row.Cells[1].Value;$value=[int]$script:Choices[$choice];$changes[$key]=$value
-            if($key -eq 'R3'){continue}
-            $mode=switch([string]$row.Cells[2].Value){'按住連發'{1}'按一下切換'{2}default{0}}
+            $original=$row.Tag;$key=$original.Key;$choice=[string]$row.Cells[1].Value;$value=[int]$script:Choices[$choice]
+            $targetChanged=$choice -ne $original.Target -and $value -ne -1
+            $modeLabel=[string]$row.Cells[2].Value;$rateText=[string]$row.Cells[3].Value
+            $turboEdited=$modeLabel -ne $original.Mode -or $rateText -ne $original.Rate
+            if(-not $targetChanged -and -not $turboEdited){continue}
+            if($targetChanged){$changes[$key]=$value}
+            $mode=switch($modeLabel){'按住連發'{1}'按一下切換'{2}default{0}}
             $rate=if($mode -eq 0){0}else{[int]$row.Cells[3].Value}
-            $offset=13+3*$script:KeyIds[$key];$targetChanged=$value -ne -1 -and $value -ne $script:LoadedState.Mapping[$offset]
-            if($targetChanged -or $mode -ne $script:LoadedState.Mapping[$offset+1] -or $rate -ne $script:LoadedState.Mapping[$offset+2]){$turboChanges[$key]=@{Mode=$mode;Rate=$rate}}
+            $turboChanges[$key]=@{Mode=$mode;Rate=$rate}
         }
         $message=Set-VaderState $script:LoadedState $changes $turboChanges $masterToggle.Checked
-        & $reload;$status.Text=$message
+        & $reload
+        if($script:ReloadSucceeded){$status.Text=if($message -eq '設定已相同，沒有重複寫入。'){$message}else{"配置 $($script:LoadedState.Profile+1) 已儲存、備份並驗證。"}}
+        $statusTip.SetToolTip($status,$message)
     }
     catch { $status.Text=$_.Exception.Message; $save.Enabled=$true }
     finally {$load.Enabled=$true;$form.UseWaitCursor=$false}
@@ -234,15 +252,15 @@ $save.Add_Click({
 $testLayout=[Windows.Forms.TableLayoutPanel]::new();$testLayout.Dock='Fill';$testLayout.Padding=[Windows.Forms.Padding]::new(12);$testLayout.ColumnCount=1;$testLayout.RowCount=5
 [void]$testLayout.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent,100))
 foreach($kind in @('AutoSize','AutoSize','Percent','Percent','AutoSize')){[void]$testLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::$kind,50))};$testPage.Controls.Add($testLayout)
-$testHint=[Windows.Forms.Label]::new();$testHint.AutoSize=$true;$testHint.Dock='Fill';$testHint.Text="上方實體訊號可辨識 C／Z／M1 等擴充鍵；下方顯示映射後的遊戲輸出。`n原始 R3 觸發、遊戲 R3 放開，代表屏蔽有效。";$testLayout.Controls.Add($testHint,0,0)
+$testHint=[Windows.Forms.Label]::new();$testHint.AutoSize=$true;$testHint.Dock='Fill';$testHint.Text="比較實體按鍵與映射後的遊戲輸出。`n依序按放按鍵，檢查映射、連發、搖桿與扳機反應。";$testLayout.Controls.Add($testHint,0,0)
 $testButton=[Windows.Forms.Button]::new();$testButton.AutoSize=$true;$testButton.MinimumSize=[Drawing.Size]::new(140,36);$testButton.Text='開始測試';$testLayout.Controls.Add($testButton,0,1)
 $rawGroup=[Windows.Forms.GroupBox]::new();$rawGroup.Text='實體原始訊號';$rawGroup.Dock='Fill';$testLayout.Controls.Add($rawGroup,0,2)
 $rawLayout=[Windows.Forms.TableLayoutPanel]::new();$rawLayout.Dock='Fill';$rawLayout.Padding=[Windows.Forms.Padding]::new(8,16,8,8);$rawLayout.ColumnCount=1;$rawLayout.RowCount=2;[void]$rawLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize));[void]$rawLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent,100));$rawGroup.Controls.Add($rawLayout)
-$rawR3=[Windows.Forms.Label]::new();$rawR3.AutoSize=$true;$rawR3.Dock='Fill';$rawR3.Text='R3：等待資料';$rawLayout.Controls.Add($rawR3,0,0)
+$rawSummary=[Windows.Forms.Label]::new();$rawSummary.AutoSize=$true;$rawSummary.Dock='Fill';$rawSummary.Text='等待實體按鍵資料';$rawLayout.Controls.Add($rawSummary,0,0)
 $rawText=[Windows.Forms.TextBox]::new();$rawText.Dock='Fill';$rawText.Multiline=$true;$rawText.ReadOnly=$true;$rawText.ScrollBars='Vertical';$rawText.Font=[Drawing.Font]::new('Consolas',11);$rawLayout.Controls.Add($rawText,0,1)
 $outputGroup=[Windows.Forms.GroupBox]::new();$outputGroup.Text='遊戲收到的輸出（XInput）';$outputGroup.Dock='Fill';$testLayout.Controls.Add($outputGroup,0,3)
 $outputLayout=[Windows.Forms.TableLayoutPanel]::new();$outputLayout.Dock='Fill';$outputLayout.Padding=[Windows.Forms.Padding]::new(8,16,8,8);$outputLayout.ColumnCount=1;$outputLayout.RowCount=2;[void]$outputLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::AutoSize));[void]$outputLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent,100));$outputGroup.Controls.Add($outputLayout)
-$outputR3=[Windows.Forms.Label]::new();$outputR3.AutoSize=$true;$outputR3.Dock='Fill';$outputR3.Text='R3：等待資料';$outputLayout.Controls.Add($outputR3,0,0)
+$outputSummary=[Windows.Forms.Label]::new();$outputSummary.AutoSize=$true;$outputSummary.Dock='Fill';$outputSummary.Text='等待遊戲輸出';$outputLayout.Controls.Add($outputSummary,0,0)
 $outputText=[Windows.Forms.TextBox]::new();$outputText.Dock='Fill';$outputText.Multiline=$true;$outputText.ReadOnly=$true;$outputText.ScrollBars='Vertical';$outputText.Font=[Drawing.Font]::new('Consolas',11);$outputLayout.Controls.Add($outputText,0,1)
 $testStatus=[Windows.Forms.Label]::new();$testStatus.AutoSize=$true;$testStatus.Dock='Fill';$testStatus.Text='離開本頁或關閉工具時，會恢復原始資料串流的先前狀態。';$testLayout.Controls.Add($testStatus,0,4)
 $script:TestLink=$null;$script:TestFlags=$null;$script:LatestRaw=$null
@@ -263,14 +281,14 @@ $formatInput={param($view) "Pressed: $($view.Pressed)`r`n`r`nLX: $($view.LX)    
 $timer.Add_Tick({
     try{
         for($i=0;$i -lt 100;$i++){$report=$script:TestLink.Read(0);if($null -eq $report){break};$v=[VaderLink]::RawInput($report);if($null -ne $v){$script:LatestRaw=$v}}
-        if($script:LatestRaw){$rawText.Text=& $formatInput $script:LatestRaw;$rawR3.Text='原始 R3：'+$(if($script:LatestRaw.R3){'按住'}else{'放開'});$rawR3.ForeColor=$(if($script:LatestRaw.R3){[Drawing.Color]::Firebrick}else{[Drawing.Color]::ForestGreen})}
+        if($script:LatestRaw){$rawText.Text=& $formatInput $script:LatestRaw;$pressed=if($script:LatestRaw.Pressed){$script:LatestRaw.Pressed}else{'無'};$rawSummary.Text="實體按下：$pressed"}
         $out=[VaderLink]::GameOutput()
-        if($out.Connected){$outputText.Text=& $formatInput $out;$outputR3.Text="遊戲 R3："+$(if($out.R3){'按住'}else{'放開'})+"  · XInput 槽位 $($out.Slot)";$outputR3.ForeColor=$(if($out.R3){[Drawing.Color]::RoyalBlue}else{[Drawing.Color]::ForestGreen})}else{$outputR3.Text='XInput 手把未連接';$outputText.Text=''}
+        if($out.Connected){$outputText.Text=& $formatInput $out;$pressed=if($out.Pressed){$out.Pressed}else{'無'};$outputSummary.Text="XInput 槽位 $($out.Slot) · 輸出按下：$pressed"}else{$outputSummary.Text='XInput 手把未連接';$outputText.Text=''}
     }catch{$testStatus.Text=$_.Exception.Message;& $stopTest}
 })
 $testButton.Add_Click({if($script:TestLink){& $stopTest}else{& $startTest}})
 $tabs.Add_SelectedIndexChanged({if($tabs.SelectedIndex -eq 1){& $startTest}else{& $stopTest}})
-$form.Add_FormClosing({& $stopTest;$timer.Dispose()})
+$form.Add_FormClosing({param($sender,$eventArgs)if($script:DraftChanged -and [Windows.Forms.MessageBox]::Show($form,'捨棄未儲存的修改並關閉？','關閉工具','YesNo','Question') -ne 'Yes'){$eventArgs.Cancel=$true;return};& $stopTest;$timer.Dispose();$statusTip.Dispose()})
 $form.Add_Shown($reload)
 [void]$form.ShowDialog()
 $form.Dispose()

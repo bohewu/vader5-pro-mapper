@@ -42,6 +42,13 @@ public sealed class VaderLink : IDisposable {
  [DllImport("hid.dll")] static extern int HidP_GetCaps(IntPtr data,IntPtr caps);
  IntPtr device;
  public byte ReportId {get;set;}
+ public bool Wireless {get;private set;}
+ public static ushort UsagePage(string path){
+  using(var f=CreateFile(path,0,3,IntPtr.Zero,3,0,IntPtr.Zero)){
+   if(f.IsInvalid)throw new IOException("Cannot inspect HID interface");IntPtr pp;if(!HidD_GetPreparsedData(f,out pp))throw new IOException("Cannot inspect HID descriptor");IntPtr c=Marshal.AllocHGlobal(64);
+   try{if(HidP_GetCaps(pp,c)!=0x00110000)throw new IOException("Cannot read HID capabilities");return (ushort)Marshal.ReadInt16(c,2);}finally{Marshal.FreeHGlobal(c);HidD_FreePreparsedData(pp);}
+  }
+ }
  public static string Version {get {return Marshal.PtrToStringAnsi(hid_version_str());}}
  public static string Caps(string path) {
   using(var f=CreateFile(path,0,3,IntPtr.Zero,3,0,IntPtr.Zero)){
@@ -52,7 +59,7 @@ public sealed class VaderLink : IDisposable {
    finally{Marshal.FreeHGlobal(c);HidD_FreePreparsedData(pp);}
   }
  }
- public VaderLink(string path,byte reportId=0){hid_init();ReportId=reportId;device=hid_open_path(path);if(device==IntPtr.Zero)throw new IOException("hid_open_path: "+Marshal.PtrToStringUni(hid_error(IntPtr.Zero)));}
+ public VaderLink(string path,byte reportId=0,bool wireless=false){hid_init();ReportId=reportId;Wireless=wireless;device=hid_open_path(path);if(device==IntPtr.Zero)throw new IOException("hid_open_path: "+Marshal.PtrToStringUni(hid_error(IntPtr.Zero)));}
  public void Dispose(){if(device!=IntPtr.Zero){hid_close(device);device=IntPtr.Zero;}}
  static readonly HashSet<byte> Allowed=new HashSet<byte>{0x01,0x02,0x03,0x04,0x10,0x11,0x13,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xAC};
  public void Write(byte command,params byte[] payload){
@@ -65,7 +72,21 @@ public sealed class VaderLink : IDisposable {
  }
  public byte[] Read(int ms){byte[] b=new byte[65];int n=hid_read_timeout(device,b,(UIntPtr)b.Length,ms);if(n<0)throw new IOException("HID read: "+Marshal.PtrToStringUni(hid_error(device)));if(n==0)return null;int offset=(n>2&&b[0]==0x5A&&b[1]==0xA5)?0:(n>3&&b[1]==0x5A&&b[2]==0xA5)?1:-1;if(offset<0)return null;byte[] frame=new byte[n-offset];Array.Copy(b,offset,frame,0,frame.Length);return frame;}
  public void Drain(){for(int i=0;i<512;i++)if(Read(0)==null)break;}
- public byte[] Request(byte command,params byte[] payload){Drain();Write(command,payload);var end=DateTime.UtcNow.AddMilliseconds(command==0xA6?10000:1800);while(DateTime.UtcNow<end){var b=Read(100);if(b!=null&&b.Length>=32&&b[2]==command){int sum=0;for(int i=2;i<31;i++)sum+=b[i];if((byte)sum!=b[31])throw new IOException("Reply checksum failed");return b;}}throw new TimeoutException("No reply for "+command.ToString("X2")+", reportId="+ReportId);}
+ public static bool ReplyChecksumValid(byte[] b){if(b==null||b.Length!=32||b[0]!=0x5A||b[1]!=0xA5)return false;int sum=0;for(int i=2;i<31;i++)sum+=b[i];return (byte)sum==b[31];}
+ public static bool DongleInfoTelemetry(byte[] b,bool wireless){
+  // The tested 2.4G receiver forwards this firmware's heartbeat with a stale checksum.
+  // Only known read-only identity telemetry is exempt; configuration and ACKs are not.
+  return wireless&&b!=null&&b.Length==32&&b[0]==0x5A&&b[1]==0xA5&&b[2]==1&&b[3]==1&&b[4]==0&&b[5]==130&&b[6]==2&&b[15]==0x71&&b[16]==0x54;
+ }
+ public byte[] Request(byte command,params byte[] payload){
+  bool readOnly=command==1||command==2||command==3||command==4||command==0x10||command==0xA1;
+  int attempts=Wireless&&readOnly?3:1;int invalid=0;
+  for(int attempt=0;attempt<attempts;attempt++){
+   Drain();Write(command,payload);var end=DateTime.UtcNow.AddMilliseconds(command==0xA6?10000:1800);
+   while(DateTime.UtcNow<end){var b=Read(100);if(b!=null&&b.Length==32&&b[2]==command){if(ReplyChecksumValid(b)||DongleInfoTelemetry(b,Wireless))return b;invalid++;}}
+  }
+  if(invalid>0)throw new IOException("Reply checksum failed for 0x"+command.ToString("X2")+" ("+invalid+" invalid replies)");throw new TimeoutException("No reply for "+command.ToString("X2")+", reportId="+ReportId);
+ }
  public byte[] WriteMapping(byte profile,byte[] bytes){
   if(profile>3||bytes.Length!=840||bytes[0]!=2||bytes[1]!=3)throw new ArgumentException("Only PC profiles and layout 3.2 are writable");
   if(Request(0xA1)[5]!=profile)throw new InvalidOperationException("The intended profile must already be active");
@@ -76,6 +97,12 @@ public sealed class VaderLink : IDisposable {
  }
  public byte[] ReadBlob(byte command,byte profile){
   if(command!=0xA3&&command!=0xA7&&command!=0xAC)throw new ArgumentException("Not a read blob command");
+  for(int attempt=0;attempt<(Wireless?3:1);attempt++){
+   try{if(Wireless)Request(0xA1);return ReadBlobOnce(command,profile);}
+   catch(TimeoutException){if(!Wireless||attempt==2)throw;System.Threading.Thread.Sleep(80);}
+  }throw new IOException("Configuration transfer did not complete");
+ }
+ byte[] ReadBlobOnce(byte command,byte profile){
   Drain();Write(command,profile,20);var parts=new Dictionary<int,byte[]>();int total=0;var end=DateTime.UtcNow.AddSeconds(4);
   while(DateTime.UtcNow<end){var r=Read(100);if(r==null||r.Length<32||r[2]!=command||r[5]!=profile)continue;int sum=0;for(int i=2;i<31;i++)sum+=r[i];if((byte)sum!=r[31])throw new IOException("Blob checksum failed");if(total==0)total=r[3];if(total==0||r[3]!=total||r[4]>=total)throw new IOException("Bad blob header");byte[] chunk=new byte[20];Array.Copy(r,6,chunk,0,20);parts[r[4]]=chunk;if(parts.Count==total){byte[] blob=new byte[20*total];for(int i=0;i<total;i++)Array.Copy(parts[i],0,blob,20*i,20);return blob;}}
   throw new TimeoutException("Incomplete blob "+command.ToString("X2")+" "+parts.Count+"/"+total);
