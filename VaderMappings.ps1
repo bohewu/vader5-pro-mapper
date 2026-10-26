@@ -21,6 +21,8 @@ if ($Mode -eq 'Gui' -and -not $GuiChild) {
     exit
 }
 if (-not ('VaderLink' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'VaderLink.cs') }
+if (-not ('VaderMacroStore' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'VaderMacros.cs') }
+. (Join-Path $PSScriptRoot 'VaderMacroActions.ps1')
 $script:KeyIds = [ordered]@{ Up=0; Right=1; Down=2; Left=3; A=4; B=5; View=6; X=7; Y=8; Menu=9; LB=10; RB=11; LT=12; RT=13; L3=14; R3=15; C=16; Z=17; M1=18; M2=19; M3=20; M4=21; LM=22; RM=23 }
 $script:Choices = [ordered]@{ '保留目前設定'=-1; '預設'=255; '停用遊戲輸出'=254; A=4; B=5; X=7; Y=8; LB=10; RB=11; LT=12; RT=13; L3=14; R3=15; Up=0; Down=2; Left=3; Right=1; View=6; Menu=9 }
 
@@ -173,7 +175,7 @@ $sourceColumn=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $sourceColumn.He
 $targetColumn=[Windows.Forms.DataGridViewComboBoxColumn]::new();$targetColumn.HeaderText='輸出映射';$targetColumn.FlatStyle='Standard';foreach($choice in $script:Choices.Keys){[void]$targetColumn.Items.Add($choice)};[void]$grid.Columns.Add($targetColumn);$editorLayout.Controls.Add($grid,0,1)
 $modeColumn=[Windows.Forms.DataGridViewComboBoxColumn]::new();$modeColumn.HeaderText='連發模式';$modeColumn.FlatStyle='Standard';[void]$modeColumn.Items.AddRange([object[]]@('關閉','按住連發','按一下切換'));[void]$grid.Columns.Add($modeColumn)
 $rateColumn=[Windows.Forms.DataGridViewTextBoxColumn]::new();$rateColumn.HeaderText='次／秒';$rateColumn.FillWeight=45;[void]$grid.Columns.Add($rateColumn)
-$grid.Add_EditingControlShowing({param($sender,$eventArgs)
+$readableDropdown={param($sender,$eventArgs)
     if($eventArgs.Control -is [Windows.Forms.ComboBox]){
         $combo=$eventArgs.Control;$combo.BackColor=[Drawing.Color]::White;$combo.ForeColor=[Drawing.Color]::Black;$combo.FlatStyle='Standard';$combo.DrawMode='OwnerDrawFixed'
         if($combo.Tag -ne 'VaderReadableDropdown'){
@@ -189,13 +191,14 @@ $grid.Add_EditingControlShowing({param($sender,$eventArgs)
             })
         }
     }
-})
+}
+$grid.Add_EditingControlShowing($readableDropdown)
 $toolbar=[Windows.Forms.FlowLayoutPanel]::new();$toolbar.AutoSize=$true;$toolbar.Dock='Fill';$toolbar.WrapContents=$false;$editorLayout.Controls.Add($toolbar,0,2)
 $load=[Windows.Forms.Button]::new();$load.Text='重新讀取';$load.AutoSize=$true;$load.MinimumSize=[Drawing.Size]::new(120,36);$toolbar.Controls.Add($load)
 $save=[Windows.Forms.Button]::new();$save.Text='儲存到手把';$save.AutoSize=$true;$save.MinimumSize=[Drawing.Size]::new(150,36);$save.Enabled=$false;$toolbar.Controls.Add($save)
 $masterToggle=[Windows.Forms.CheckBox]::new();$masterToggle.Text='Turbo 總開關（所有配置）';$masterToggle.AutoSize=$true;$masterToggle.Margin=[Windows.Forms.Padding]::new(16,10,0,0);$toolbar.Controls.Add($masterToggle)
 $status=[Windows.Forms.Label]::new();$status.AutoSize=$true;$status.Dock='Fill';$status.Text='尚未連接。';$editorLayout.Controls.Add($status,0,3)
-$foot=[Windows.Forms.Label]::new();$foot.AutoSize=$true;$foot.Dock='Fill';$foot.Text="連發速度 1～20 次／秒。巨集與鍵鼠功能可保留，此工具不編輯它們。`n「停用遊戲輸出」不會清除既有鍵盤／滑鼠綁定。";$foot.Font=[Drawing.Font]::new('Microsoft JhengHei UI',8);$editorLayout.Controls.Add($foot,0,4)
+$foot=[Windows.Forms.Label]::new();$foot.AutoSize=$true;$foot.Dock='Fill';$foot.Text="連發速度 1～20 次／秒。巨集請至「巨集」頁編輯。`n「停用遊戲輸出」不會清除既有鍵盤／滑鼠綁定。";$foot.Font=[Drawing.Font]::new('Microsoft JhengHei UI',8);$editorLayout.Controls.Add($foot,0,4)
 $script:LoadedState=$null
 $script:LoadingGrid=$false
 $script:DraftChanged=$false
@@ -243,6 +246,7 @@ $save.Add_Click({
         }
         $message=Set-VaderState $script:LoadedState $changes $turboChanges $masterToggle.Checked
         & $reload
+        $script:MacroState=$null
         if($script:ReloadSucceeded){$status.Text=if($message -eq '設定已相同，沒有重複寫入。'){$message}else{"配置 $($script:LoadedState.Profile+1) 已儲存、備份並驗證。"}}
         $statusTip.SetToolTip($status,$message)
     }
@@ -288,7 +292,8 @@ $timer.Add_Tick({
 })
 $testButton.Add_Click({if($script:TestLink){& $stopTest}else{& $startTest}})
 $tabs.Add_SelectedIndexChanged({if($tabs.SelectedIndex -eq 1){& $startTest}else{& $stopTest}})
-$form.Add_FormClosing({param($sender,$eventArgs)if($script:DraftChanged -and [Windows.Forms.MessageBox]::Show($form,'捨棄未儲存的修改並關閉？','關閉工具','YesNo','Question') -ne 'Yes'){$eventArgs.Cancel=$true;return};& $stopTest;$timer.Dispose();$statusTip.Dispose()})
+. (Join-Path $PSScriptRoot 'VaderMacroPage.ps1')
+$form.Add_FormClosing({param($sender,$eventArgs)if(($script:DraftChanged -or $script:MacroDirty) -and [Windows.Forms.MessageBox]::Show($form,'捨棄未儲存的修改並關閉？','關閉工具','YesNo','Question') -ne 'Yes'){$eventArgs.Cancel=$true;return};& $stopTest;$timer.Dispose();$statusTip.Dispose()})
 $form.Add_Shown($reload)
 [void]$form.ShowDialog()
 $form.Dispose()

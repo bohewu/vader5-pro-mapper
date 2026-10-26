@@ -61,7 +61,7 @@ public sealed class VaderLink : IDisposable {
  }
  public VaderLink(string path,byte reportId=0,bool wireless=false){hid_init();ReportId=reportId;Wireless=wireless;device=hid_open_path(path);if(device==IntPtr.Zero)throw new IOException("hid_open_path: "+Marshal.PtrToStringUni(hid_error(IntPtr.Zero)));}
  public void Dispose(){if(device!=IntPtr.Zero){hid_close(device);device=IntPtr.Zero;}}
- static readonly HashSet<byte> Allowed=new HashSet<byte>{0x01,0x02,0x03,0x04,0x10,0x11,0x13,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xAC};
+ static readonly HashSet<byte> Allowed=new HashSet<byte>{0x01,0x02,0x03,0x04,0x10,0x11,0x13,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xAC,0xAD,0xAE};
  public void Write(byte command,params byte[] payload){
   if(!Allowed.Contains(command))throw new InvalidOperationException("Command not allowed: "+command.ToString("X2"));
   if(command==0x13&&(payload.Length!=2||payload[0]!=4||payload[1]>1))throw new InvalidOperationException("Only the Turbo master switch may be changed");
@@ -101,6 +101,24 @@ public sealed class VaderLink : IDisposable {
    try{if(Wireless)Request(0xA1);return ReadBlobOnce(command,profile);}
    catch(TimeoutException){if(!Wireless||attempt==2)throw;System.Threading.Thread.Sleep(80);}
   }throw new IOException("Configuration transfer did not complete");
+ }
+ void Upload(byte start,byte packet,byte profile,byte[] bytes){
+  int count=bytes.Length/20;Request(start,profile,0,(byte)count,20);
+  for(int i=0;i<count;i++){byte[] payload=new byte[21];payload[0]=(byte)i;Array.Copy(bytes,i*20,payload,1,20);Request(packet,payload);}
+ }
+ public void WriteProfileWithMacros(byte profile,byte[] mapping,byte[] macros){
+  if(profile>3||mapping==null||mapping.Length!=840||mapping[0]!=2||mapping[1]!=3||macros==null||macros.Length!=1660)throw new ArgumentException("Only layout 3.2 and 1660-byte macro stores are writable");
+  if(Request(0xA1)[5]!=profile)throw new InvalidOperationException("The intended profile must already be active");
+  Upload(0xA4,0xA5,profile,mapping);Upload(0xAD,0xAE,profile,macros);
+  if(Request(0xA1)[5]!=profile)throw new InvalidOperationException("Active profile changed during upload");
+  Request(0xA6,mapping[225],mapping[226]);System.Threading.Thread.Sleep(250);
+  Request(0xA2,profile);System.Threading.Thread.Sleep(200);
+  if(Request(0xA1)[5]!=profile)throw new IOException("Macro profile activation failed");
+  Verify(ReadBlob(0xA3,profile),mapping,"mapping");Verify(ReadBlob(0xAC,profile),macros,"macros");
+ }
+ static void Verify(byte[] actual,byte[] expected,string label){
+  if(actual.Length!=expected.Length)throw new IOException("Written "+label+" length differs");
+  for(int i=0;i<actual.Length;i++)if(actual[i]!=expected[i])throw new IOException("Written "+label+" differs at "+i);
  }
  byte[] ReadBlobOnce(byte command,byte profile){
   Drain();Write(command,profile,20);var parts=new Dictionary<int,byte[]>();int total=0;var end=DateTime.UtcNow.AddSeconds(4);
