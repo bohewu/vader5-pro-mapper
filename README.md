@@ -21,7 +21,7 @@ Built with PowerShell, C# and **Windows Forms**. Settings are saved on the contr
 
 Testing has used **one controller on one PC**. Receiver reading, a mapping write, complete read-back, exact restoration, and raw/XInput monitoring have been checked. Cable persistence after reconnect and native turbo have also been checked. This is not a compatibility guarantee for every PC, firmware or receiver revision.
 
-**Macro testing:** USB cable, M3 triggering an A/B sequence, with once, hold and toggle playback. Complete macro/mapping read-backs and exact restoration passed after each test. Macro writes through the 2.4 GHz receiver have not yet been tested.
+**Macro testing:** USB cable and USB 2.4 GHz receiver, M3 triggering an A/B sequence, with once, hold and toggle playback. Both connections passed macro/mapping writes, complete read-backs and exact restoration after each test. Receiver tests also confirmed at least one second without further output after each sequence stopped. This covers the tested controller and receiver on the PC above, not every device or timing combination.
 
 Saved mappings are expected to follow the controller to another PC. Running this editor there still requires the runtime, native library and compatible device mode below. Drivers, competing software and multiple connected controllers can affect detection and test results. A second PC has not been tested.
 

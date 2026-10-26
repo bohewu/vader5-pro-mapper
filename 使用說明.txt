@@ -4,7 +4,8 @@ Vader5 Pro Mapper — 改鍵與測試
 需要 64 位元 Windows、64 位元 PowerShell 7.2 以上及已安裝的飛智空間站 hidapi.dll。
 已驗證標準黑武士 5 Pro、韌體 7.1.5.4、格式 3.2、USB 有線及 2.4 GHz 接收器。
 實測限於一台 PC、一支手把，尚未驗證跨 PC 相容性。
-巨集三種播放模式已用 USB 有線實測；接收器巨集寫入尚未實測。
+巨集三種播放模式已用 USB 有線及 2.4 GHz 接收器實測，寫入、讀回及原配置還原皆通過。
+接收器已確認各模式停止後至少一秒沒有額外輸出；結果限於已測裝置與此 PC。
 
 請先完整退出空間站，並在系統管理員 PowerShell 停止背景服務：
 Stop-Service -Name 'Flydigi Space Station Service'
